@@ -40,6 +40,9 @@ RING, RING_HOVER = "#2b2d35", "#3d6df2"
 CAT, CAT_HOVER = "#363a4d", "#7a4df2"
 TEXT, MUTED, OK, ERR = "#e6e6e6", "#8a8f9c", "#3ecf8e", "#f25f5c"
 CMD, CMD_HOVER = "#7d8290", "#c9d4ff"   # comando bajo cada etiqueta (atenuado)
+DANGER, DANGER_HOVER = "#5a2a31", "#c9414f"   # "! Etiqueta => ..." (peligroso)
+PER_RING = 10                     # más entradas se reparten en "Más ▸"
+GEN_TTL = 30                      # s que vale una lista de topics/nodos/...
 SHOW_CMD = True                   # False = ocultar el comando en los sectores
 
 # Geometría
@@ -139,8 +142,16 @@ class Daemon:
             self.shaper = None              # sin Shape: se verá un cuadrado
         log_t(t0, f"ventana creada ({len(self.mon_rects)} monitor/es)")
 
-        self.stack = []              # [(título, items)]
+        self.stack = []              # [{"title", "items", "fill", "loading"}]
         self.note = ""
+        self.gens, self.ws = {}, None
+        self._ws_cache = {}          # ws -> (instante, (paquetes, launch files))
+        self._gen_cache = {}         # comando -> (instante, opciones | None)
+        self._gen_threads = {}
+        self.query = ""              # búsqueda escribiendo
+        self.results = None
+        self.armed = None            # entrada peligrosa esperando el 2º click
+        self._poll = None
         self.hover = None
         self.last_xy = None
         self.status = None
@@ -174,9 +185,15 @@ class Daemon:
         c.bind("<Button-3>", lambda e: self.back())
         t.bind("<FocusOut>", lambda e: self.root.after(200, self._check_focus))
         t.protocol("WM_DELETE_WINDOW", self.hide)
-        t.bind("<Escape>", lambda e: self.close_or_hide())
-        t.bind("<BackSpace>", lambda e: self.back())
+        t.bind("<Escape>", self.on_escape)
+        t.bind("<BackSpace>", self.on_backspace)
+        t.bind("<Return>", self.on_return)
+        t.bind("<KP_Enter>", self.on_return)
         t.bind("<Key>", self.on_key)
+        self.entry = tk.Entry(c, font=self.f_mono, width=12, justify="center",
+                              bg=RING, fg=TEXT, insertbackground=TEXT,
+                              relief="flat", highlightthickness=1,
+                              highlightcolor=RING_HOVER, highlightbackground=MUTED)
         # Tk mete la ventana dentro de un marco X que crea la primera vez que se
         # muestra; se fuerza ahora (fuera de la pantalla) para poder recortar
         # ese marco con Shape: es el que pinta el compositor
@@ -305,10 +322,18 @@ class Daemon:
         if self._new_rects:
             self.mon_rects, self._new_rects = self._new_rects, None
         self._load_icons()
-        tree, title, note = core.load_tree(override)
+        info = core.load_tree(override, None if override else core.active_cwd())
+        self.gens, self.ws = info.gens, info.ws
+        root = list(info.tree)
+        if info.ws:                         # categoría automática del workspace
+            root.insert(0, core.ws_category(info.ws, self._ws_scan(info.ws)))
+        recent = core.load_recent()
+        if recent:
+            root.insert(1 if info.ws else 0, ("Recientes", recent))
         log_t(t0, "comandos releídos") if t0 else None
-        self.stack = [(title, tree)]
-        self.note = note
+        self.stack = []
+        self._push(info.title, root)
+        self.note = info.note
         self.hover = None
         self.status = None
         self.done = False
@@ -337,13 +362,26 @@ class Daemon:
         self.top.focus_force()
         self.c.focus_set()
         log_t(t0, "ventana mostrada") if t0 else None
+        # el trabajo de fondo, cuando la rueda ya está pintada: un hilo de
+        # Python en marcha retrasa el repintado de Tk (~170 ms en vez de ~55)
+        self.root.after(300, lambda: self._background(info))
+
+    def _background(self, info):
         self._refresh_monitors_async()      # para la próxima vez
+        if self.shown:
+            self._prefetch(info.tree)
+        if info.ws:
+            self._refresh_ws_async(info.ws)
 
     def hide(self):
         self.shown = False
         self.done = True
         self.top.withdraw()
         self.c.delete("all")
+        self.entry.place_forget()
+        if self._poll:
+            self.root.after_cancel(self._poll)
+            self._poll = None
 
     def close_or_hide(self):
         self.hide()
@@ -356,9 +394,109 @@ class Daemon:
             except (tk.TclError, KeyError):
                 pass
 
-    # -- datos
+    # ------------------------------------------------- workspace y huecos
+    def _ws_scan(self, ws):
+        if ws not in self._ws_cache:        # la 1ª vez, ya; luego, en un hilo
+            self._ws_cache[ws] = (time.monotonic(), core.scan_ws(ws))
+        return self._ws_cache[ws][1]
+
+    def _refresh_ws_async(self, ws):
+        if time.monotonic() - self._ws_cache.get(ws, (0, None))[0] < 15:
+            return
+
+        def work():
+            self._ws_cache[ws] = (time.monotonic(), core.scan_ws(ws))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _prefetch(self, tree):
+        """Lanza ya, en hilos, los generadores que usa algún comando: así las
+        opciones suelen estar listas cuando eliges el comando."""
+        needed, todo = set(), [tree]
+        while todo:
+            for _, val in todo.pop():
+                if isinstance(val, list):
+                    todo.append(val)
+                else:
+                    needed.update(val.holes())
+        for name in needed:
+            if name in self.gens:
+                self._gen_start(self.gens[name])
+
+    def _gen_start(self, cmd):
+        hit = self._gen_cache.get(cmd)
+        if hit and time.monotonic() - hit[0] < GEN_TTL:
+            return
+        th = self._gen_threads.get(cmd)
+        if th and th.is_alive():
+            return
+
+        def work():
+            self._gen_cache[cmd] = (time.monotonic(), core.run_generator(cmd))
+        th = threading.Thread(target=work, daemon=True)
+        self._gen_threads[cmd] = th
+        th.start()
+
+    def _gen_ready(self, cmd):
+        """Opciones del generador, o None si aún está trabajando."""
+        th = self._gen_threads.get(cmd)
+        if th and th.is_alive():
+            return None
+        hit = self._gen_cache.get(cmd)
+        return hit[1] if hit else None
+
+    def _options_for(self, name):
+        """(opciones, comando del generador). opciones=None: hay que esperar."""
+        if name in core.WS_GENERATORS and name not in self.gens:
+            if not self.ws:
+                return [], None
+            pkgs, launches = self._ws_scan(self.ws)
+            return (pkgs if name == "pkg" else [f"{p} {f}" for p, f in launches]), None
+        cmd = self.gens.get(name)
+        if cmd is None:
+            return "text", None             # sin generador: se escribe a mano
+        self._gen_start(cmd)
+        opts = self._gen_ready(cmd)
+        return opts, cmd
+
+    def _fill_next(self, label, cmd, paste):
+        holes = cmd.holes()
+        if not holes:
+            self._finish(label, cmd, paste)
+            return
+        name = holes[0]
+        opts, gen = self._options_for(name)
+        fill = {"label": label, "cmd": cmd, "name": name, "paste": paste}
+        if opts == "text":
+            self._push("{" + name + "}", [], fill=fill, text=True)
+        elif opts is None:                  # el generador aún no ha terminado
+            self._push("{" + name + "}", [], fill=fill, loading=gen)
+            self._poll_loading()
+        else:
+            self._push("{" + name + "}", [(o, Fill(o)) for o in opts], fill=fill)
+        self._refresh_hover()
+
+    def _poll_loading(self):
+        self._poll = None
+        st = self.stack[-1] if self.stack else None
+        if not (self.shown and st and st["loading"]):
+            return
+        opts = self._gen_ready(st["loading"])
+        if opts is None:
+            self._poll = self.root.after(60, self._poll_loading)
+            return
+        st["loading"] = None
+        st["items"] = paged([(o, Fill(o)) for o in opts])
+        st["empty"] = "Sin opciones (¿ROS/Docker en marcha?)"
+        self._refresh_hover()
+
+    # -- monitor activo / datos
+    def _push(self, title, items, fill=None, loading=None, text=False):
+        self.stack.append({"title": title, "items": paged(items), "fill": fill,
+                           "loading": loading, "text": text, "empty": None})
+        self.query, self.results, self.armed = "", None, None
+
     def items(self):
-        return self.stack[-1][1]
+        return self.results if self.results is not None else self.stack[-1]["items"]
 
     def sector_at(self, x, y):
         dx, dy = x - self.cx, y - self.cy
@@ -409,20 +547,34 @@ class Daemon:
                 hi = mid - 1
         return text[:lo].rstrip() + "…"
 
+    def _preview(self, val):
+        """Comando que se copiaría: en un hueco, con la opción ya puesta."""
+        st = self.stack[-1]
+        if isinstance(val, Fill) and st["fill"]:
+            return st["fill"]["cmd"].fill(st["fill"]["name"], val)
+        return val
+
     def draw(self):
         c = self.c
         c.delete("all")
         cx, cy = self.cx, self.cy
-        title, items = self.stack[-1]
+        st = self.stack[-1]
+        title, items = st["title"], self.items()
         n = len(items)
-
 
         if n:
             step = 2 * math.pi / n
             for i, (label, val) in enumerate(items):
                 is_cat = isinstance(val, list)
                 hov = self.hover == i
-                fill = (CAT_HOVER if hov else CAT) if is_cat else (RING_HOVER if hov else RING)
+                danger = getattr(val, "danger", False)
+                armed = self.armed == (id(st), i)
+                if is_cat:
+                    fill = CAT_HOVER if hov else CAT
+                elif danger:
+                    fill = DANGER_HOVER if hov or armed else DANGER
+                else:
+                    fill = RING_HOVER if hov else RING
                 a0 = -math.pi / 2 + i * step - step / 2
                 a1 = a0 + step
                 c.create_polygon(self.ring_pts(a0, a1), fill=fill, outline=DISC, width=3)
@@ -431,15 +583,15 @@ class Daemon:
                 rm = (R_IN + R_OUT) / 2 + 6
                 width = max(60, min(140, rm * step * 0.85))
                 tx, ty = cx + rm * math.cos(mid), cy + rm * math.sin(mid)
-                show_cmd = SHOW_CMD and not is_cat and val != label
+                show_cmd = SHOW_CMD and not is_cat and not isinstance(val, Fill) and val != label
                 icon = self.icon_for(label, fill)
                 if icon:                            # baja el texto para dejar sitio
                     ty += (icon.height() + 4) / 2
+                text = f"{label} ▸" if is_cat else ("⚠ " + label if danger else label)
                 tid = c.create_text(tx, ty - 1 if show_cmd else ty,
-                              anchor="s" if show_cmd else "center",
-                              text=f"{label} ▸" if is_cat else label,
-                              width=width, justify="center", fill=TEXT,
-                              font=self.f_cat if is_cat else self.f_item)
+                                    anchor="s" if show_cmd else "center",
+                                    text=text, width=width, justify="center", fill=TEXT,
+                                    font=self.f_cat if is_cat else self.f_item)
                 if icon:
                     c.create_image(tx, c.bbox(tid)[1] - 4, image=icon, anchor="s")
                 if show_cmd:
@@ -454,19 +606,35 @@ class Daemon:
                                   text=str((i + 1) % 10), fill=MUTED, font=self.f_small)
 
         r0 = R_IN - 6
-        if self.status:
-            msg, col = self.status
+        armed_here = self.armed and self.armed[0] == id(st)
+        if self.status or armed_here:
+            msg, col = self.status or ("¿Seguro?\notro click", DANGER_HOVER)
             c.create_oval(cx - r0, cy - r0, cx + r0, cy + r0, fill=col, outline="")
-            c.create_text(cx, cy, text=msg, width=2 * R_IN - 24, fill=BG,
+            c.create_text(cx, cy, text=msg, width=2 * R_IN - 24,
+                          fill=TEXT if armed_here and not self.status else BG,
                           font=self.f_center, justify="center")
         else:
             hov = self.hover == "center"
             c.create_oval(cx - r0, cy - r0, cx + r0, cy + r0,
                           fill=RING_HOVER if hov else RING, outline="")
-            c.create_text(cx, cy - 10, text=title, width=2 * R_IN - 24,
-                          fill=TEXT, font=self.f_center, justify="center")
-            c.create_text(cx, cy + 16, text="← atrás" if len(self.stack) > 1 else "✕ cerrar",
+            if self.query:
+                c.create_text(cx, cy - 10, text=f"⌕ {self.query}", width=2 * R_IN - 24,
+                              fill=TEXT, font=self.f_center, justify="center")
+                hint = "Esc = borrar"
+            elif st["text"]:
+                c.create_text(cx, cy - 26, text=title, fill=TEXT, font=self.f_center)
+                self.entry.place(x=cx, y=cy, anchor="center")
+                hint = "Enter = OK"
+            else:
+                c.create_text(cx, cy - 10, text=title, width=2 * R_IN - 24,
+                              fill=TEXT, font=self.f_center, justify="center")
+                hint = "← atrás" if len(self.stack) > 1 else "✕ cerrar"
+                if st["loading"]:
+                    hint = "cargando…"
+            c.create_text(cx, cy + (26 if st["text"] else 16), text=hint,
                           fill=MUTED, font=self.f_small)
+        if not st["text"]:
+            self.entry.place_forget()
 
         prev, col = "", MUTED
         if isinstance(self.hover, int) and self.hover < n:
@@ -474,9 +642,15 @@ class Daemon:
             if isinstance(val, list):
                 prev = f"{len(val)} entradas"
             else:
-                prev, col = val, TEXT
-        elif n == 0:
-            prev, col = self.note or "Categoría vacía", ERR
+                prev, col = self._preview(val), TEXT
+        elif st["text"] and st["fill"]:
+            prev, col = st["fill"]["cmd"], TEXT
+        elif n == 0 and not st["loading"]:
+            if self.results is not None:
+                prev = "Nada coincide"
+            else:
+                prev, col = (st["empty"] or (self.note if len(self.stack) == 1 else "")
+                             or "Categoría vacía"), ERR
         elif self.hover == "outside":
             prev = "click fuera = cerrar"
         foot = None
@@ -496,6 +670,8 @@ class Daemon:
             self.draw()
 
     def on_motion(self, e):
+        if e.widget is not self.c:
+            return
         self.last_xy = (e.x, e.y)
         self.set_hover(self.sector_at(e.x, e.y))
 
@@ -508,29 +684,114 @@ class Daemon:
         elif s == "outside":
             self.hide()
         elif isinstance(s, int):
-            self.select(s)
+            self.select(s, paste=bool(e.state & 0x1))    # Shift+click = pegar
+
+    def _typing(self):
+        return self.stack and self.stack[-1]["text"]
 
     def on_key(self, e):
-        if self.shown and not self.done and e.char and e.char.isdigit():
-            self.select((int(e.char) - 1) % 10)
+        if not self.shown or self.done or self._typing():
+            return
+        ch = e.char
+        if ch and ch.isdigit():
+            self.select((int(ch) - 1) % 10)
+        elif ch and (ch.isalpha() or ch in " -_./:") and not self.stack[-1]["loading"]:
+            self.query += ch.lower()        # buscar escribiendo
+            self._search()
+
+    def on_backspace(self, e):
+        if self._typing():
+            return                          # borra en el campo de texto
+        if self.query:
+            self.query = self.query[:-1]
+            self._search()
+        else:
+            self.back()
+
+    def on_escape(self, e):
+        if self.query:
+            self.query = ""
+            self._search()
+        elif self._typing():
+            self.back()
+        else:
+            self.hide()
+
+    def on_return(self, e):
+        if self.done or not self.shown:
+            return
+        st = self.stack[-1]
+        if st["text"]:
+            value = self.entry.get().strip()
+            if value:
+                f = st["fill"]
+                self._fill_next(f["label"], f["cmd"].fill(f["name"], value), f["paste"])
+        elif self.results:
+            self.select(0)
+
+    def _search(self):
+        """Filtra por lo escrito todo lo que cuelga del anillo actual."""
+        if not self.query:
+            self.results = None
+        else:
+            words = self.query.split()
+            found, todo = [], [self.stack[-1]["items"]]
+            while todo:
+                for label, val in todo.pop(0):
+                    if isinstance(val, list):
+                        todo.append(val)
+                    elif all(w in f"{label} {val}".lower() for w in words):
+                        found.append((label, val))
+            self.results = paged(found)
+        self.armed = None
+        self._refresh_hover()
 
     def _refresh_hover(self):
         self.hover = self.sector_at(*self.last_xy) if self.last_xy else None
+        if self.stack[-1]["text"]:
+            self.entry.delete(0, "end")
+            self.entry.focus_set()
+        else:
+            self.c.focus_set()
         self.draw()
 
-    def select(self, i):
+    def select(self, i, paste=False):
         items = self.items()
         if i >= len(items):
             return
         label, val = items[i]
+        st = self.stack[-1]
         if isinstance(val, list):
-            self.stack.append((label, val))
+            self._push(label, val)
             self._refresh_hover()
             return
-        ok = core.copy_to_clipboard(val)
+        if isinstance(val, Fill):
+            f = st["fill"]
+            self._fill_next(f["label"], f["cmd"].fill(f["name"], val), f["paste"] or paste)
+            return
+        if val.danger and self.armed != (id(st), i):
+            self.armed = (id(st), i)        # 1er click: solo avisa
+            self.draw()
+            return
+        self.armed = None
+        self._fill_next(label, val, paste)
+
+    def _finish(self, label, cmd, paste):
+        ok = core.copy_to_clipboard(cmd)
         self.done = True
         self.hover = None
+        self.entry.place_forget()
         if ok:
+            core.add_recent(label, cmd)
+        if ok and paste and not core.shutil.which("xdotool"):
+            self.status = ("✓ Copiado\n(falta xdotool)", OK)
+            self.draw()
+            self._close_after = self.root.after(1500, self.hide)
+        elif ok and paste:
+            self.status = ("✓ Pegando", OK)
+            self.draw()
+            self._close_after = self.root.after(120, self._paste)
+        elif ok:
             self.status = ("✓ Copiado", OK)
             self.draw()
             self._close_after = self.root.after(350, self.hide)
@@ -539,14 +800,31 @@ class Daemon:
             self.draw()
             self._close_after = self.root.after(2500, self.hide)
 
+    def _paste(self):
+        self.hide()
+        threading.Thread(target=core.paste_to_active, daemon=True).start()
+
     def back(self):
         if self.done or not self.shown:
             return
         if len(self.stack) > 1:
             self.stack.pop()
+            self.query, self.results, self.armed = "", None, None
             self._refresh_hover()
         else:
             self.hide()
+
+
+class Fill(str):
+    """Una opción para rellenar un hueco {nombre} del comando."""
+
+
+def paged(items, per=PER_RING):
+    """Más de `per` entradas: las que no caben van a "Más ▸" (y así sucesivamente)."""
+    items = list(items)
+    if len(items) <= per:
+        return items
+    return items[:per - 1] + [("Más", paged(items[per - 1:], per))]
 
 
 def _lock_memory():

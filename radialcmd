@@ -9,6 +9,12 @@ Uso:
   radialcmd --edit          abre el archivo de comandos activo en el editor
   radialcmd --which         muestra qué archivos se están usando
   radialcmd --status        dice si el servicio en segundo plano está activo
+  radialcmd --hook          añade a ~/.bashrc el aviso del directorio actual
+
+Por proyecto: si la última terminal en la que pulsaste Enter está dentro de
+una carpeta con un archivo .radialcmd (o en una carpeta superior), se añade a
+los generales. Si está dentro de un workspace colcon (src/ + install/), sale
+sola una categoría con source, build por paquete y sus launch files.
 
 Qué archivo se usa (el primero que exista de esta lista):
   1. -f ARCHIVO
@@ -26,11 +32,18 @@ Formato del archivo:
   []                        vuelve al nivel raíz
   Etiqueta => comando       entrada (el comando puede llevar |, &&, ::, etc.)
   comando suelto            la etiqueta es el propio comando
+  ! Etiqueta => comando     peligroso: sector en rojo, pide un segundo click
+  Hz => ros2 topic hz {topic}   {hueco}: al elegirlo se ofrecen las opciones
+                            ({topic} {node} {service} {iface} {container}
+                            {pkg} {launch}); sin generador, se escribe a mano
+  @topic = comando          generador propio: una opción por línea de salida
 
 Controles:
   ratón: click en sector = elegir / entrar   click centro o botón dcho = atrás
+         Shift+click = copiar y pegar en la ventana activa (necesita xdotool)
          click fuera del anillo = cerrar
-  teclado: 1-9, 0 = elegir sector   Backspace = atrás   Esc = cerrar
+  teclado: 1-9, 0 = elegir sector   letras = buscar   Enter = el primero
+           Backspace = atrás   Esc = cerrar
   volver a pulsar el atajo con el menú abierto lo cierra
 """
 import os
@@ -122,7 +135,13 @@ def main():
     ap.add_argument("--edit", action="store_true", help="abrir el archivo de comandos activo")
     ap.add_argument("--which", action="store_true", help="mostrar qué archivos se usan")
     ap.add_argument("--status", action="store_true", help="comprobar si el servicio está activo")
+    ap.add_argument("--hook", action="store_true", help="añadir a ~/.bashrc el aviso del directorio")
     a = ap.parse_args()
+
+    if a.hook:
+        print("Añadido a ~/.bashrc (abre una terminal nueva)" if core.install_hook()
+              else "Ya estaba en ~/.bashrc")
+        return
 
     if a.status:
         print("Servicio activo" if _alive() else "Servicio NO activo (se arrancará al abrir el menú)")
@@ -133,6 +152,14 @@ def main():
         print(f"Origen: {origin}")
         for f in files:
             print(f"  {'✓' if f.is_file() else '✗ no existe'}  {f}")
+        cwd = core.active_cwd()
+        if cwd is None:
+            print("Directorio activo: desconocido (falta el hook: radialcmd --hook)")
+        elif not a.file:
+            print(f"Directorio activo: {cwd}")
+            proj, ws = core.find_project_file(cwd), core.find_colcon_ws(cwd)
+            print(f"  proyecto:  {proj or '—'}")
+            print(f"  workspace: {ws or '—'}")
         return
 
     if a.edit:

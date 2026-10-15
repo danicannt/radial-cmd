@@ -3,22 +3,30 @@
 #   [Categoría/Sub]          subanillo
 #   []                       vuelve a la raíz
 #   Etiqueta => comando
-# Ideal: 4-8 entradas por anillo. Si crece, mete subcategorías.
+#   ! Etiqueta => comando    peligroso: sector en rojo, pide un segundo click
+#   {topic} {node} {service} {iface} {container} {pkg} {launch}
+#                            huecos: al elegir el comando se ofrecen las opciones
+#   {cualquier_otra}         hueco sin generador: se escribe en el centro
+#   @nombre = comando        generador propio para {nombre} (una opción por línea)
+# Ideal: 4-8 entradas por anillo; con más de 10 se reparten solas en "Más".
+#
+# Por proyecto: un archivo .radialcmd (mismo formato) en la carpeta del
+# proyecto se añade a este cuando la terminal activa está dentro de ella.
 
 [ROS 2]
 Source Jazzy => source /opt/ros/jazzy/setup.bash
 Source workspace => source install/setup.bash
 Topics => ros2 topic list
 Nodos => ros2 node list
-Hz de un topic => ros2 topic hz /TOPIC
-Info de un topic => ros2 topic info -v /TOPIC
+Hz de un topic => ros2 topic hz {topic}
+Info de un topic => ros2 topic info -v {topic}
 Reiniciar daemon => ros2 daemon stop && ros2 daemon start
 rqt_graph => ros2 run rqt_graph rqt_graph
 
 [Build]
 colcon build => colcon build --symlink-install
-Un paquete => colcon build --symlink-install --packages-select PAQUETE
-Build limpio => rm -rf build install log && colcon build --symlink-install
+Un paquete => colcon build --symlink-install --packages-select {pkg}
+! Build limpio => rm -rf build install log && colcon build --symlink-install
 rosdep => rosdep install --from-paths src --ignore-src -r -y
 
 [Cámaras]
@@ -27,19 +35,19 @@ Buffer UDP grande => sudo sysctl -w net.core.rmem_max=33554432 net.core.rmem_def
 Topics de imagen => ros2 topic list | grep -i image
 
 [Cámaras/Red]
-MTU 9000 (jumbo) => sudo ip link set dev INTERFAZ mtu 9000
-Ver MTU => ip link show INTERFAZ
-Ping cámara => ping -c 3 IP_CAMARA
+MTU 9000 (jumbo) => sudo ip link set dev {iface} mtu 9000
+Ver MTU => ip link show {iface}
+Ping cámara => ping -c 3 {ip_camara}
 
 [Docker]
 Contenedores activos => docker ps
 Todos los contenedores => docker ps -a
-Entrar a contenedor => docker exec -it CONTENEDOR bash
-Logs en vivo => docker logs -f CONTENEDOR
+Entrar a contenedor => docker exec -it {container} bash
+Logs en vivo => docker logs -f {container}
 Compose up => docker compose up -d
 Compose down => docker compose down
 Rebuild compose => docker compose up -d --build
-Limpiar todo => docker system prune -f
+! Limpiar todo => docker system prune -f
 
 [Debug]
 Variables ROS => printenv | grep -E 'ROS|RMW'

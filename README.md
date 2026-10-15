@@ -10,10 +10,19 @@ Menú radial para tener a mano los comandos que más usas al desarrollar, testea
 
 - **Rápido:** un servicio en segundo plano tiene la rueda ya cargada, así que aparece en unos 50 ms.
 - **Categorías y subcategorías** en un archivo de texto plano que se relee en cada apertura.
-- **Copia a los dos portapapeles:** pega con `Ctrl+V` y también con el click central del ratón.
+- **Por proyecto:** un `.radialcmd` en la carpeta del proyecto se suma a tus comandos generales cuando trabajas en ella.
+- **Workspaces de ROS 2 automáticos:** dentro de un workspace colcon aparece sola una categoría con `source`, build por paquete y sus launch files.
+- **Huecos con opciones reales:** `ros2 topic hz {topic}` te ofrece los topics que hay ahora mismo; `{iface}`, `{container}`, `{pkg}`… igual.
+- **Recientes, búsqueda escribiendo y aviso en comandos peligrosos.**
+- **Copia a los dos portapapeles** (`Ctrl+V` y click central), o **pega directamente** con Shift+click.
 - **Atajo de teclado** (`Ctrl+Alt+C` por defecto) y, opcionalmente, **combo de ratón**: botón lateral + click izquierdo.
-- **Iconos PNG** en las categorías para encontrarlas de un vistazo.
-- **Varios monitores:** la rueda sale centrada en el puntero, en el monitor donde esté.
+- **Iconos PNG** en las categorías y **varios monitores**: la rueda sale bajo el puntero, en el monitor donde esté.
+
+<p align="center">
+  <img src="docs/workspace.png" width="32%" alt="Launch files del workspace detectado">
+  <img src="docs/huecos.png" width="32%" alt="Eligiendo el topic para ros2 topic hz">
+  <img src="docs/peligro.png" width="32%" alt="Comando peligroso pidiendo confirmación">
+</p>
 
 Probado en Ubuntu 24.04 con GNOME sobre X11.
 
@@ -27,8 +36,9 @@ cd radial-cmd
 
 `install.sh` hace esto:
 
-- instala las dependencias (`python3-tk`, `python3-pil`, `wl-clipboard`, `xclip`);
+- instala las dependencias (`python3-tk`, `python3-pil`, `wl-clipboard`, `xclip`, `xdotool`);
 - copia los scripts a `~/.local/bin`;
+- añade a `~/.bashrc` una línea que apunta el directorio de la terminal en cada prompt (para los proyectos y workspaces);
 - crea `~/.config/radialcmd/comandos.txt` a partir de [`comandos.example.txt`](comandos.example.txt), sin sobrescribirlo si ya existe;
 - activa el servicio `radialcmd.service` de systemd para tu usuario;
 - crea el atajo de GNOME `Ctrl+Alt+C`.
@@ -61,10 +71,16 @@ El botón lateral pulsado solo sigue funcionando como siempre: "adelante" en el 
 | Acción | Ratón | Teclado |
 |---|---|---|
 | Elegir sector / entrar en categoría | click izquierdo | `1`–`9`, `0` |
+| Copiar y pegar en la ventana activa | Shift+click | |
+| Buscar en el anillo y sus subcategorías | | escribir letras; `Enter` = el primero |
 | Volver atrás | click en el centro o botón derecho | `Backspace` |
-| Cerrar | click fuera de la rueda | `Esc` o volver a pulsar el atajo |
+| Cerrar | click fuera de la rueda | `Esc` (con búsqueda: la borra) o volver a pulsar el atajo |
 
 Al elegir un comando, el centro muestra **✓ Copiado** y la rueda se cierra sola. Debajo de la rueda se ve el comando completo del sector que tienes bajo el ratón.
+
+- **Recientes:** los últimos 8 comandos usados, ya rellenados, en su propio anillo (se guardan en `~/.local/state/radialcmd/`).
+- **Más de 10 entradas:** las que no caben van a un sector **Más ▸**, para que todas tengan tecla.
+- **Pegar con Shift+click:** en terminales manda `Ctrl+Shift+V` y en el resto `Ctrl+V`. Necesita `xdotool`.
 
 ### Línea de comandos
 
@@ -74,7 +90,10 @@ radialcmd -f otro.txt   # abre la rueda con otro archivo, solo esta vez
 radialcmd --edit     # abre en el editor el archivo de comandos activo
 radialcmd --which    # muestra qué archivos se están leyendo
 radialcmd --status   # dice si el servicio está activo
+radialcmd --hook     # añade a ~/.bashrc el aviso del directorio (si no lo hizo install.sh)
 ```
+
+`--which` también dice qué directorio, proyecto y workspace se están usando.
 
 ## El archivo de comandos
 
@@ -86,16 +105,46 @@ Por defecto es `~/.config/radialcmd/comandos.txt`. Se relee en cada apertura, as
 Source Jazzy => source /opt/ros/jazzy/setup.bash
 Topics => ros2 topic list
 
+Hz de un topic => ros2 topic hz {topic}  # hueco: al elegirlo, se ofrecen los topics
+! Build limpio => rm -rf build install log  # peligroso: en rojo, pide un segundo click
+
 [Cámaras/Red]                            # subcategoría
-MTU 9000 => sudo ip link set dev INTERFAZ mtu 9000
+MTU 9000 => sudo ip link set dev {iface} mtu 9000
+Ping => ping -c 3 {ip}                   # hueco sin generador: se escribe en el centro
 
 []                                       # vuelve a la raíz
 docker ps                                # sin "=>": la etiqueta es el propio comando
+@topic = docker exec mi_contenedor bash -c 'source /opt/ros/humble/setup.bash && ros2 topic list'
 ```
 
 - **`Etiqueta => comando`:** el comando puede llevar `|`, `&&`, comillas, etc.
 - **Tamaño de los anillos:** queda mejor con 4–8 entradas por anillo; si crece, usa subcategorías.
 - **Categorías repetidas:** se juntan, también entre archivos distintos.
+
+### Huecos y generadores
+
+Un `{nombre}` en minúsculas dentro de un comando es un hueco. Al elegir el comando se abre otro anillo con las opciones, eliges una y se copia el comando ya completo. Si hay varios huecos, se piden uno tras otro.
+
+| Hueco | Opciones |
+|---|---|
+| `{topic}`, `{node}`, `{service}` | `ros2 topic list`, `ros2 node list`, `ros2 service list` |
+| `{iface}` | interfaces de red (`ip -br link`) |
+| `{container}` | contenedores en marcha (`docker ps`) |
+| `{pkg}`, `{launch}` | paquetes y launch files del workspace detectado |
+| cualquier otro | un campo de texto en el centro (`Enter` para aceptar) |
+
+- **Generadores propios:** con `@nombre = comando` cada línea de la salida es una opción. También sirve para redefinir los de serie; por ejemplo, para listar los topics de dentro de un contenedor, como en el ejemplo de arriba.
+- **Cuándo se ejecutan:** los generadores se lanzan en segundo plano nada más abrir la rueda, porque `ros2 topic list` tarda ~1 s. Mientras tanto, el anillo pone "cargando…". El resultado se reutiliza durante 30 s.
+- **Qué no es un hueco:** `${VAR}`, `{a,b}` y `{{.Names}}` de Docker se dejan tal cual.
+
+### Proyectos y workspaces
+
+La línea que `install.sh` añade a `~/.bashrc` apunta el directorio de la terminal cada vez que pulsas Enter. Al abrir la rueda, se mira la última terminal usada:
+
+- **Archivo `.radialcmd`:** si está en esa carpeta o en una superior, se suma a tus comandos generales, con el mismo formato. Así, cada proyecto tiene sus comandos y el centro de la rueda muestra el nombre del proyecto.
+- **Workspace colcon:** si hay uno (una carpeta con `src/` e `install/`), aparece la categoría **ROS *nombre_ws***. Incluye `source` con la ruta absoluta, para pegarlo desde cualquier carpeta; build de todo o por paquete; y un anillo con los launch files (`ros2 launch paquete archivo`).
+
+Con ROS dentro de un contenedor, la terminal del contenedor no avisa de su directorio. Abre la rueda desde una terminal del host que esté en el workspace.
 
 ### Varios archivos (comandos generales + proyecto)
 
@@ -145,7 +194,8 @@ flowchart TB
     select --> copy
     mon --> monitors
 
-    files[("comandos.txt<br/>~/.bashrc")] --> load
+    files[("comandos.txt · .radialcmd<br/>~/.bashrc")] --> load
+    hook[("radialcmd.cwd<br/>(hook de PROMPT_COMMAND)")] --> load
     copy --> clip[["CLIPBOARD (Ctrl+V)<br/>PRIMARY (click central)"]]
     monitors --> x11[["Servidor X"]]
 ```

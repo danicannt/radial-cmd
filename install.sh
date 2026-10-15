@@ -11,8 +11,8 @@ CFG="$HOME/.config/radialcmd"
 UNIT_DIR="$HOME/.config/systemd/user"
 BINDING="${1:-<Ctrl><Alt>c}"
 
-echo "→ Dependencias (python3-tk, python3-pil, wl-clipboard, xclip)"
-sudo apt-get install -y python3-tk python3-pil wl-clipboard xclip
+echo "→ Dependencias (python3-tk, python3-pil, wl-clipboard, xclip, xdotool)"
+sudo apt-get install -y python3-tk python3-pil wl-clipboard xclip xdotool
 
 mkdir -p "$BIN" "$CFG" "$UNIT_DIR"
 install -m 755 "$HERE/radialcmd"        "$BIN/radialcmd"
@@ -26,6 +26,9 @@ else
   cp "$HERE/comandos.example.txt" "$CFG/comandos.txt"
   echo "→ Comandos de ejemplo en $CFG/comandos.txt"
 fi
+
+echo "→ Aviso del directorio de la terminal (para los archivos .radialcmd por proyecto)"
+python3 "$BIN/radialcmd" --hook
 
 echo "→ Servicio en segundo plano (para que el menú se abra al instante)"
 cat > "$UNIT_DIR/radialcmd.service" <<EOF
