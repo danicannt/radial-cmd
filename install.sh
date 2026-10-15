@@ -11,8 +11,8 @@ CFG="$HOME/.config/radialcmd"
 UNIT_DIR="$HOME/.config/systemd/user"
 BINDING="${1:-<Ctrl><Alt>c}"
 
-echo "→ Dependencias (python3-tk, wl-clipboard, xclip)"
-sudo apt-get install -y python3-tk wl-clipboard xclip
+echo "→ Dependencias (python3-tk, python3-pil, wl-clipboard, xclip)"
+sudo apt-get install -y python3-tk python3-pil wl-clipboard xclip
 
 mkdir -p "$BIN" "$CFG" "$UNIT_DIR"
 install -m 755 "$HERE/radialcmd"        "$BIN/radialcmd"
