@@ -1,0 +1,7 @@
+# comandos personales (pueden llevar rutas y proyectos privados)
+comandos.txt
+comandos (Copy).txt
+*.local.txt
+
+__pycache__/
+*.pyc

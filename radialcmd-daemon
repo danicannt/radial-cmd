@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""
+radialcmd-daemon — proceso en segundo plano que mantiene tkinter ya cargado
+y las ventanas del menú ya creadas (pero ocultas), para que abrir el menú
+sea instantáneo. No lo ejecutas tú: lo arranca el servicio de systemd, o el
+propio `radialcmd` la primera vez si el servicio no está activo.
+
+Habla por un socket Unix (radialcmd_core.SOCK). Mensajes que entiende:
+  TOGGLE              abre el menú (o lo cierra, si ya estaba abierto)
+  TOGGLE:/ruta.txt     igual, pero usando ese archivo solo esta vez
+  PING                 responde PONG (para que el cliente compruebe que vive)
+"""
+import math
+import os
+import socket
+import ctypes
+import ctypes.util
+import sys
+import threading
+import time
+import tkinter as tk
+import tkinter.font as tkfont
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import radialcmd_core as core
+
+DEBUG = os.environ.get("RADIALCMD_DEBUG_TIMING") == "1"
+
+
+def log_t(t0, label):
+    if DEBUG:
+        print(f"[{(time.monotonic() - t0) * 1000:6.1f} ms] {label}", file=sys.stderr, flush=True)
+
+
+# Tema
+BG, DISC = "#000000", "#15161a"   # BG = texto sobre el círculo de estado
+RING, RING_HOVER = "#2b2d35", "#3d6df2"
+CAT, CAT_HOVER = "#363a4d", "#7a4df2"
+TEXT, MUTED, OK, ERR = "#e6e6e6", "#8a8f9c", "#3ecf8e", "#f25f5c"
+CMD, CMD_HOVER = "#7d8290", "#c9d4ff"   # comando bajo cada etiqueta (atenuado)
+SHOW_CMD = True                   # False = ocultar el comando en los sectores
+
+# Geometría
+R_IN, R_OUT, PAD = 72, 240, 16
+FOOT = 56                         # espacio bajo el anillo para el comando
+SIZE = 2 * (R_OUT + PAD)          # la ventana: un cuadrado con la rueda + el pie
+R_DISC = R_OUT + 6                # radio del disco de fondo (= forma de la ventana)
+
+
+class Shaper:
+    """Recorta la ventana con la extensión Shape de X: solo existe (se ve y
+    recibe clicks) dentro del disco y del recuadro del pie. Sin transparencias
+    ni capa a pantalla completa, así el compositor apenas tiene trabajo."""
+
+    class Rect(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_short), ("y", ctypes.c_short),
+                    ("width", ctypes.c_ushort), ("height", ctypes.c_ushort)]
+
+    def __init__(self):
+        x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
+        self.xext = ctypes.CDLL(ctypes.util.find_library("Xext"))
+        x11.XOpenDisplay.restype = ctypes.c_void_p
+        x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        x11.XFlush.argtypes = [ctypes.c_void_p]
+        x11.XQueryTree.argtypes = [ctypes.c_void_p, ctypes.c_ulong] + [ctypes.c_void_p] * 4
+        x11.XFree.argtypes = [ctypes.c_void_p]
+        self.xext.XShapeCombineRectangles.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        self.x11 = x11
+        self.dpy = x11.XOpenDisplay(None)
+        if not self.dpy:
+            raise OSError("XOpenDisplay")
+        # el disco, como una franja horizontal por cada fila de píxeles
+        c = SIZE // 2
+        self.disc = []
+        for y in range(-R_DISC, R_DISC + 1):
+            half = int(math.sqrt(max(0, R_DISC * R_DISC - y * y)))
+            self.disc.append((c - half, c + y, 2 * half + 1, 1))
+        self._last = None
+
+    def toplevel(self, wid):
+        """Sube por el árbol X hasta la ventana hija directa de la raíz: es la
+        que el compositor pinta (Tk mete la suya dentro de un marco)."""
+        root, parent = ctypes.c_ulong(), ctypes.c_ulong()
+        kids, n = ctypes.c_void_p(), ctypes.c_uint()
+        while True:
+            if not self.x11.XQueryTree(self.dpy, wid, ctypes.byref(root), ctypes.byref(parent),
+                                       ctypes.byref(kids), ctypes.byref(n)):
+                return wid
+            if kids:
+                self.x11.XFree(kids)
+            if parent.value in (0, root.value):
+                return wid
+            wid = parent.value
+
+    def apply(self, wid, extra=None):
+        rects = self.disc + ([extra] if extra else [])
+        if (wid, rects) == self._last:
+            return
+        self._last = (wid, rects)
+        arr = (self.Rect * len(rects))(*[self.Rect(*r) for r in rects])
+        # ShapeBounding=0, ShapeSet=0, Unsorted=0
+        self.xext.XShapeCombineRectangles(self.dpy, wid, 0, 0, 0, arr, len(rects), 0, 0)
+        self.x11.XFlush(self.dpy)
+
+
+
+class Daemon:
+    def __init__(self):
+        t0 = time.monotonic()
+        self.root = tk.Tk()
+        self.root.withdraw()
+
+        self.f_item = tkfont.Font(family="Ubuntu", size=10)
+        self.f_cat = tkfont.Font(family="Ubuntu", size=10, weight="bold")
+        self.f_center = tkfont.Font(family="Ubuntu", size=11, weight="bold")
+        self.f_small = tkfont.Font(family="Ubuntu", size=8)
+        self.f_mono = tkfont.Font(family="Ubuntu Mono", size=11)
+        self.f_cmd = tkfont.Font(family="Ubuntu Mono", size=8)
+
+        self._fit_cache = {}
+        # monitores: al abrir se usa la última geometría conocida y se
+        # actualiza en un hilo aparte (por si conectas/desconectas pantallas)
+        self.mon_rects = core.monitors()
+        self._new_rects = None
+        self._mon_thread = None
+        self._frame_id = None
+        self._make_window()
+        try:
+            self.shaper = Shaper()
+        except OSError:
+            self.shaper = None              # sin Shape: se verá un cuadrado
+        log_t(t0, f"ventana creada ({len(self.mon_rects)} monitor/es)")
+
+        self.stack = []              # [(título, items)]
+        self.note = ""
+        self.hover = None
+        self.last_xy = None
+        self.status = None
+        self.done = False
+        self.cx = self.cy = SIZE // 2
+        self.shown = False
+        self.override = None
+        self._close_after = None
+
+        self._open_socket()
+        log_t(t0, "daemon listo, esperando (sin consumir CPU hasta que llegue algo)")
+
+    # ------------------------------------------------------------ ventanas
+    def _make_window(self):
+        t = tk.Toplevel(self.root)
+        t.title("radialcmd")
+        t.configure(bg=DISC, cursor="arrow")
+        # overrideredirect: la ventana no pasa por el gestor de ventanas en
+        # absoluto (ni decoración, ni animaciones). Aparece y desaparece al
+        # instante, sin que Mutter/GNOME tenga ocasión de animarla.
+        t.overrideredirect(True)
+        t.geometry(f"{SIZE}x{SIZE + FOOT}+0+0")
+        try:
+            t.attributes("-topmost", True)
+        except tk.TclError:
+            pass
+        c = tk.Canvas(t, bg=DISC, highlightthickness=0, width=SIZE, height=SIZE + FOOT)
+        c.pack(fill="both", expand=True)
+        c.bind("<Motion>", self.on_motion)
+        c.bind("<Button-1>", self.on_click)
+        c.bind("<Button-3>", lambda e: self.back())
+        t.bind("<FocusOut>", lambda e: self.root.after(200, self._check_focus))
+        t.protocol("WM_DELETE_WINDOW", self.hide)
+        t.bind("<Escape>", lambda e: self.close_or_hide())
+        t.bind("<BackSpace>", lambda e: self.back())
+        t.bind("<Key>", self.on_key)
+        # Tk mete la ventana dentro de un marco X que crea la primera vez que se
+        # muestra; se fuerza ahora (fuera de la pantalla) para poder recortar
+        # ese marco con Shape: es el que pinta el compositor
+        t.geometry(f"{SIZE}x{SIZE + FOOT}+-10000+-10000")
+        t.deiconify()
+        t.update_idletasks()
+        t.withdraw()
+        self.top, self.c = t, c
+
+    def _wid(self):
+        """Id X de la ventana que realmente se mapea (el marco de Tk)."""
+        if self._frame_id is None:
+            self._frame_id = self.shaper.toplevel(self.top.winfo_id())
+        return self._frame_id
+
+    def _refresh_monitors_async(self):
+        if self._mon_thread and self._mon_thread.is_alive():
+            return
+
+        def work():
+            self._new_rects = core.monitors()   # solo guarda; Tk se toca en el hilo principal
+        self._mon_thread = threading.Thread(target=work, daemon=True)
+        self._mon_thread.start()
+
+    # ------------------------------------------------------------- socket
+    # Nada de "preguntar cada x milisegundos si ha llegado algo": el socket
+    # se registra en el bucle de eventos de Tk (select/epoll de verdad), así
+    # que el proceso duerme del todo hasta que el sistema operativo le
+    # avisa de una conexión. Por eso en reposo no gasta CPU.
+    def _open_socket(self):
+        try:
+            core.SOCK.unlink()
+        except FileNotFoundError:
+            pass
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(str(core.SOCK))
+        self.srv.listen(8)
+        self.srv.setblocking(False)
+        self.root.tk.createfilehandler(self.srv, tk.READABLE, self._on_accept)
+
+    def _on_accept(self, fd, mask):
+        try:
+            conn, _ = self.srv.accept()
+        except OSError:
+            return
+        t0 = time.monotonic()
+        if DEBUG:
+            print(f"[conexión @ {time.time():.3f}]", file=sys.stderr, flush=True)
+        conn.settimeout(0.5)   # el cliente manda el mensaje entero de golpe
+        try:
+            data = conn.recv(4096).decode("utf-8", "replace").strip()
+            if data == "PING":
+                conn.sendall(b"PONG")
+            else:
+                conn.sendall(b"OK")
+                self._handle_message(data, t0)
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def _handle_message(self, msg, t0):
+        if msg.startswith("TOGGLE"):
+            override = msg[len("TOGGLE:"):] if msg.startswith("TOGGLE:") else None
+            if self.shown and not override:
+                self.hide()
+            else:
+                self.open(Path(override) if override else None, t0)
+
+    # ------------------------------------------------------------- abrir
+    def open(self, override, t0=None):
+        if self._new_rects:
+            self.mon_rects, self._new_rects = self._new_rects, None
+        tree, title, note = core.load_tree(override)
+        log_t(t0, "comandos releídos") if t0 else None
+        self.stack = [(title, tree)]
+        self.note = note
+        self.hover = None
+        self.status = None
+        self.done = False
+        self.shown = True
+        if self._close_after:
+            self.root.after_cancel(self._close_after)
+            self._close_after = None
+
+        # la rueda se centra en el puntero, sin salirse del monitor en que está
+        px, py = self.root.winfo_pointerxy()
+        mx, my, mw, mh = next(
+            (m for m in self.mon_rects
+             if m[0] <= px < m[0] + m[2] and m[1] <= py < m[1] + m[3]),
+            (0, 0, self.root.winfo_screenwidth(), self.root.winfo_screenheight()))
+        gx = max(mx, min(px - SIZE // 2, mx + mw - SIZE))
+        gy = max(my, min(py - SIZE // 2, my + mh - SIZE - FOOT))
+        self.top.geometry(f"{SIZE}x{SIZE + FOOT}+{gx}+{gy}")
+        x, y = px - gx, py - gy
+        self.last_xy = (x, y)
+        self.hover = self.sector_at(x, y)
+        self.draw()                         # dibujar antes de mostrar: sin frame vacío
+        log_t(t0, "menú dibujado") if t0 else None
+
+        self.top.deiconify()
+        self.top.lift()
+        self.top.focus_force()
+        self.c.focus_set()
+        log_t(t0, "ventana mostrada") if t0 else None
+        self._refresh_monitors_async()      # para la próxima vez
+
+    def hide(self):
+        self.shown = False
+        self.done = True
+        self.top.withdraw()
+        self.c.delete("all")
+
+    def close_or_hide(self):
+        self.hide()
+
+    def _check_focus(self):
+        if self.shown and not self.done:
+            try:
+                if self.root.focus_get() is None:
+                    self.hide()
+            except (tk.TclError, KeyError):
+                pass
+
+    # -- datos
+    def items(self):
+        return self.stack[-1][1]
+
+    def sector_at(self, x, y):
+        dx, dy = x - self.cx, y - self.cy
+        d = math.hypot(dx, dy)
+        if d < R_IN:
+            return "center"
+        if d > R_OUT:
+            return "outside"
+        n = len(self.items())
+        if n == 0:
+            return None
+        step = 2 * math.pi / n
+        rel = (math.atan2(dy, dx) + math.pi / 2 + step / 2) % (2 * math.pi)
+        return int(rel // step) % n
+
+    # -- dibujo
+    def ring_pts(self, a0, a1):
+        cx, cy = self.cx, self.cy
+        k = max(4, int((a1 - a0) / (math.pi / 60)))
+        angs = [a0 + (a1 - a0) * t / k for t in range(k + 1)]
+        outer = [(cx + R_OUT * math.cos(a), cy + R_OUT * math.sin(a)) for a in angs]
+        inner = [(cx + R_IN * math.cos(a), cy + R_IN * math.sin(a)) for a in reversed(angs)]
+        return [v for p in outer + inner for v in p]
+
+    def _truncate(self, text, lines=2):
+        per_line = max(10, int((2 * R_OUT) / self.f_mono.measure("m")))
+        limit = per_line * lines
+        return text if len(text) <= limit else text[:limit - 1] + "…"
+
+    def _fit(self, text, width, lines):
+        # se llama en cada redibujado (cada vez que el ratón cambia de sector):
+        # se cachea porque medir carácter a carácter es lento
+        key = (text, width, lines)
+        if key not in self._fit_cache:
+            self._fit_cache[key] = self._fit_uncached(text, width, lines)
+        return self._fit_cache[key]
+
+    def _fit_uncached(self, text, width, lines):
+        budget = width * lines * 0.85
+        if self.f_cmd.measure(text) <= budget:
+            return text
+        lo, hi = 0, len(text)               # búsqueda binaria del corte
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.f_cmd.measure(text[:mid] + "…") <= budget:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo].rstrip() + "…"
+
+    def draw(self):
+        c = self.c
+        c.delete("all")
+        cx, cy = self.cx, self.cy
+        title, items = self.stack[-1]
+        n = len(items)
+
+
+        if n:
+            step = 2 * math.pi / n
+            for i, (label, val) in enumerate(items):
+                is_cat = isinstance(val, list)
+                hov = self.hover == i
+                fill = (CAT_HOVER if hov else CAT) if is_cat else (RING_HOVER if hov else RING)
+                a0 = -math.pi / 2 + i * step - step / 2
+                a1 = a0 + step
+                c.create_polygon(self.ring_pts(a0, a1), fill=fill, outline=DISC, width=3)
+
+                mid = (a0 + a1) / 2
+                rm = (R_IN + R_OUT) / 2 + 6
+                width = max(60, min(140, rm * step * 0.85))
+                tx, ty = cx + rm * math.cos(mid), cy + rm * math.sin(mid)
+                show_cmd = SHOW_CMD and not is_cat and val != label
+                c.create_text(tx, ty - 1 if show_cmd else ty,
+                              anchor="s" if show_cmd else "center",
+                              text=f"{label} ▸" if is_cat else label,
+                              width=width, justify="center", fill=TEXT,
+                              font=self.f_cat if is_cat else self.f_item)
+                if show_cmd:
+                    c.create_text(tx, ty + 3, anchor="n",
+                                  text=self._fit(val, width, 3),
+                                  width=width, justify="center",
+                                  fill=CMD_HOVER if hov else CMD,
+                                  font=self.f_cmd)
+                if i < 10:
+                    nr = R_OUT - 14
+                    c.create_text(cx + nr * math.cos(mid), cy + nr * math.sin(mid),
+                                  text=str((i + 1) % 10), fill=MUTED, font=self.f_small)
+
+        r0 = R_IN - 6
+        if self.status:
+            msg, col = self.status
+            c.create_oval(cx - r0, cy - r0, cx + r0, cy + r0, fill=col, outline="")
+            c.create_text(cx, cy, text=msg, width=2 * R_IN - 24, fill=BG,
+                          font=self.f_center, justify="center")
+        else:
+            hov = self.hover == "center"
+            c.create_oval(cx - r0, cy - r0, cx + r0, cy + r0,
+                          fill=RING_HOVER if hov else RING, outline="")
+            c.create_text(cx, cy - 10, text=title, width=2 * R_IN - 24,
+                          fill=TEXT, font=self.f_center, justify="center")
+            c.create_text(cx, cy + 16, text="← atrás" if len(self.stack) > 1 else "✕ cerrar",
+                          fill=MUTED, font=self.f_small)
+
+        prev, col = "", MUTED
+        if isinstance(self.hover, int) and self.hover < n:
+            label, val = items[self.hover]
+            if isinstance(val, list):
+                prev = f"{len(val)} entradas"
+            else:
+                prev, col = val, TEXT
+        elif n == 0:
+            prev, col = self.note or "Categoría vacía", ERR
+        elif self.hover == "outside":
+            prev = "click fuera = cerrar"
+        foot = None
+        if prev:
+            tid = c.create_text(cx, cy + R_OUT + 12 + FOOT / 2, text=self._truncate(prev),
+                                width=SIZE - 24, fill=col, font=self.f_mono,
+                                justify="center")
+            x0, y0, x1, y1 = c.bbox(tid)
+            foot = (x0 - 10, y0 - 6, x1 - x0 + 20, y1 - y0 + 12)
+        if self.shaper:
+            self.shaper.apply(self._wid(), foot)
+
+    # -- interacción
+    def set_hover(self, h):
+        if h != self.hover and not self.done:
+            self.hover = h
+            self.draw()
+
+    def on_motion(self, e):
+        self.last_xy = (e.x, e.y)
+        self.set_hover(self.sector_at(e.x, e.y))
+
+    def on_click(self, e):
+        if self.done or not self.shown:
+            return
+        s = self.sector_at(e.x, e.y)
+        if s == "center":
+            self.back()
+        elif s == "outside":
+            self.hide()
+        elif isinstance(s, int):
+            self.select(s)
+
+    def on_key(self, e):
+        if self.shown and not self.done and e.char and e.char.isdigit():
+            self.select((int(e.char) - 1) % 10)
+
+    def _refresh_hover(self):
+        self.hover = self.sector_at(*self.last_xy) if self.last_xy else None
+        self.draw()
+
+    def select(self, i):
+        items = self.items()
+        if i >= len(items):
+            return
+        label, val = items[i]
+        if isinstance(val, list):
+            self.stack.append((label, val))
+            self._refresh_hover()
+            return
+        ok = core.copy_to_clipboard(val)
+        self.done = True
+        self.hover = None
+        if ok:
+            self.status = ("✓ Copiado", OK)
+            self.draw()
+            self._close_after = self.root.after(350, self.hide)
+        else:
+            self.status = ("Falta wl-copy / xclip", ERR)
+            self.draw()
+            self._close_after = self.root.after(2500, self.hide)
+
+    def back(self):
+        if self.done or not self.shown:
+            return
+        if len(self.stack) > 1:
+            self.stack.pop()
+            self._refresh_hover()
+        else:
+            self.hide()
+
+
+def _lock_memory():
+    """Que el daemon no acabe en swap mientras espera: si lo hace, la primera
+    apertura tras un rato tiene que leerlo del disco. Ocupa ~30 MB."""
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.mlockall(3)                    # MCL_CURRENT | MCL_FUTURE
+    except Exception:
+        pass
+
+
+def main():
+    _lock_memory()
+    Daemon().root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

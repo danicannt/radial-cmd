@@ -1,0 +1,49 @@
+# Comandos para el menú radial — edita libremente, se relee al abrir el menú.
+#   [Categoría]              nuevo anillo
+#   [Categoría/Sub]          subanillo
+#   []                       vuelve a la raíz
+#   Etiqueta => comando
+# Ideal: 4-8 entradas por anillo. Si crece, mete subcategorías.
+
+[ROS 2]
+Source Jazzy => source /opt/ros/jazzy/setup.bash
+Source workspace => source install/setup.bash
+Topics => ros2 topic list
+Nodos => ros2 node list
+Hz de un topic => ros2 topic hz /TOPIC
+Info de un topic => ros2 topic info -v /TOPIC
+Reiniciar daemon => ros2 daemon stop && ros2 daemon start
+rqt_graph => ros2 run rqt_graph rqt_graph
+
+[Build]
+colcon build => colcon build --symlink-install
+Un paquete => colcon build --symlink-install --packages-select PAQUETE
+Build limpio => rm -rf build install log && colcon build --symlink-install
+rosdep => rosdep install --from-paths src --ignore-src -r -y
+
+[Cámaras]
+Interfaces de red => ip -br addr
+Buffer UDP grande => sudo sysctl -w net.core.rmem_max=33554432 net.core.rmem_default=33554432
+Topics de imagen => ros2 topic list | grep -i image
+
+[Cámaras/Red]
+MTU 9000 (jumbo) => sudo ip link set dev INTERFAZ mtu 9000
+Ver MTU => ip link show INTERFAZ
+Ping cámara => ping -c 3 IP_CAMARA
+
+[Docker]
+Contenedores activos => docker ps
+Todos los contenedores => docker ps -a
+Entrar a contenedor => docker exec -it CONTENEDOR bash
+Logs en vivo => docker logs -f CONTENEDOR
+Compose up => docker compose up -d
+Compose down => docker compose down
+Rebuild compose => docker compose up -d --build
+Limpiar todo => docker system prune -f
+
+[Debug]
+Variables ROS => printenv | grep -E 'ROS|RMW'
+Procesos ROS vivos => ps aux | grep -E 'ros2|_node' | grep -v grep
+Solo localhost => export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST
+Logs recientes => ls -t ~/.ros/log | head
+ros2 doctor => ros2 doctor --report
