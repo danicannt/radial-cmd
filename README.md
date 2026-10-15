@@ -171,3 +171,7 @@ Para ver cuánto tarda cada paso de la apertura, para el servicio y lánzalo a m
 systemctl --user stop radialcmd
 RADIALCMD_DEBUG_TIMING=1 ~/.local/bin/radialcmd-daemon
 ```
+
+## Licencia
+
+[MIT](LICENSE)
