@@ -154,6 +154,9 @@ def copy_to_clipboard(text):
 
 
 # ------------------------------------------------------------------ monitores
+_XLIBS = None
+
+
 def _monitors_xrandr_lib():
     """Pregunta a XRandR directamente (RRGetMonitors). A diferencia del comando
     `xrandr`, no sondea las salidas de vídeo: tarda ~1 ms en vez de ~800 ms y
@@ -169,8 +172,11 @@ def _monitors_xrandr_lib():
                     ("mwidth", ctypes.c_int), ("mheight", ctypes.c_int),
                     ("outputs", ctypes.c_void_p)]
 
-    x11 = ctypes.CDLL(ctypes.util.find_library("X11"))
-    xrr = ctypes.CDLL(ctypes.util.find_library("Xrandr"))
+    global _XLIBS
+    if _XLIBS is None:      # find_library lanza `ldconfig -p`: solo una vez
+        _XLIBS = (ctypes.CDLL(ctypes.util.find_library("X11")),
+                  ctypes.CDLL(ctypes.util.find_library("Xrandr")))
+    x11, xrr = _XLIBS
     x11.XOpenDisplay.restype = ctypes.c_void_p
     x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
     x11.XDefaultRootWindow.restype = ctypes.c_ulong

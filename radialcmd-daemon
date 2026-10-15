@@ -12,6 +12,7 @@ Habla por un socket Unix (radialcmd_core.SOCK). Mensajes que entiende:
 """
 import math
 import os
+import re
 import socket
 import ctypes
 import ctypes.util
@@ -44,6 +45,8 @@ SHOW_CMD = True                   # False = ocultar el comando en los sectores
 # Geometría
 R_IN, R_OUT, PAD = 72, 240, 16
 FOOT = 56                         # espacio bajo el anillo para el comando
+ICON_DIR = Path.home() / ".config/radialcmd/icons"
+ICON_H, ICON_W = 26, 100          # tamaño máximo de un icono en la rueda
 SIZE = 2 * (R_OUT + PAD)          # la ventana: un cuadrado con la rueda + el pie
 R_DISC = R_OUT + 6                # radio del disco de fondo (= forma de la ventana)
 
@@ -121,6 +124,7 @@ class Daemon:
         self.f_cmd = tkfont.Font(family="Ubuntu Mono", size=8)
 
         self._fit_cache = {}
+        self._icons, self._icon_files, self._icons_mtime = {}, {}, None
         # monitores: al abrir se usa la última geometría conocida y se
         # actualiza en un hilo aparte (por si conectas/desconectas pantallas)
         self.mon_rects = core.monitors()
@@ -128,6 +132,7 @@ class Daemon:
         self._mon_thread = None
         self._frame_id = None
         self._make_window()
+        self._load_icons()
         try:
             self.shaper = Shaper()
         except OSError:
@@ -187,6 +192,60 @@ class Daemon:
             self._frame_id = self.shaper.toplevel(self.top.winfo_id())
         return self._frame_id
 
+    # ------------------------------------------------------------- iconos
+    # ~/.config/radialcmd/icons/<palabra>.png se muestra en cada entrada cuya
+    # etiqueta contenga esa palabra: ros.png -> "ROS 2", docker.png -> "Docker".
+    def _load_icons(self):
+        try:
+            mtime = ICON_DIR.stat().st_mtime
+        except OSError:
+            mtime = None
+        if mtime == self._icons_mtime:      # solo se releen si cambia la carpeta
+            return
+        self._icons_mtime = mtime
+        self._icon_files = {f.stem.lower(): f for f in ICON_DIR.glob("*.png")} if mtime else {}
+        self._icons = {}
+        for word, f in self._icon_files.items():   # preparados ya, no al abrir
+            for bg in (CAT, CAT_HOVER, RING, RING_HOVER):
+                self._icons[(word, bg)] = self._make_icon(f, bg)
+
+    def icon_for(self, label, bg):
+        for word in re.findall(r"\w+", label.lower()):
+            if word in self._icon_files:
+                key = (word, bg)
+                if key not in self._icons:
+                    self._icons[key] = self._make_icon(self._icon_files[word], bg)
+                return self._icons[key]
+        return None
+
+    def _make_icon(self, path, bg):
+        """Icono ya mezclado con el color del sector (`bg`): una imagen con
+        transparencia obliga a Tk a leer el fondo de la pantalla en cada
+        dibujado y la apertura pasaba de ~55 a ~140 ms."""
+        try:
+            import base64
+            import io
+            from PIL import Image
+            im = Image.open(path).convert("RGBA")
+            k = min(1.0, ICON_H / im.height, ICON_W / im.width)
+            if k < 1:
+                im = im.resize((max(1, round(im.width * k)), max(1, round(im.height * k))),
+                               Image.LANCZOS)
+            out = Image.new("RGBA", im.size, bg)
+            out.alpha_composite(im)
+            buf = io.BytesIO()
+            out.convert("RGB").save(buf, "PNG")
+            return tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
+        except ImportError:                 # sin Pillow: con transparencia (más lento)
+            try:
+                img = tk.PhotoImage(file=str(path))
+            except tk.TclError:
+                return None
+            k = max(1, -(-img.height() // ICON_H), -(-img.width() // ICON_W))
+            return img.subsample(k) if k > 1 else img
+        except Exception:
+            return None
+
     def _refresh_monitors_async(self):
         if self._mon_thread and self._mon_thread.is_alive():
             return
@@ -245,6 +304,7 @@ class Daemon:
     def open(self, override, t0=None):
         if self._new_rects:
             self.mon_rects, self._new_rects = self._new_rects, None
+        self._load_icons()
         tree, title, note = core.load_tree(override)
         log_t(t0, "comandos releídos") if t0 else None
         self.stack = [(title, tree)]
@@ -372,11 +432,16 @@ class Daemon:
                 width = max(60, min(140, rm * step * 0.85))
                 tx, ty = cx + rm * math.cos(mid), cy + rm * math.sin(mid)
                 show_cmd = SHOW_CMD and not is_cat and val != label
-                c.create_text(tx, ty - 1 if show_cmd else ty,
+                icon = self.icon_for(label, fill)
+                if icon:                            # baja el texto para dejar sitio
+                    ty += (icon.height() + 4) / 2
+                tid = c.create_text(tx, ty - 1 if show_cmd else ty,
                               anchor="s" if show_cmd else "center",
                               text=f"{label} ▸" if is_cat else label,
                               width=width, justify="center", fill=TEXT,
                               font=self.f_cat if is_cat else self.f_item)
+                if icon:
+                    c.create_image(tx, c.bbox(tid)[1] - 4, image=icon, anchor="s")
                 if show_cmd:
                     c.create_text(tx, ty + 3, anchor="n",
                                   text=self._fit(val, width, 3),
